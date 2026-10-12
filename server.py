@@ -829,6 +829,7 @@ class H(BaseHTTPRequestHandler):
             f["disp"] = [lat, lng]
         # samples 点太多，不外发全量（前端只用 metrics/预览）
         res.pop("samples", None)
+        res.pop("export_samples", None)
         return res
 
     def _flow(self, body: dict) -> dict:
