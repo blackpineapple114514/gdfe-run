@@ -1553,6 +1553,9 @@ def generate(path: Sequence[Any], target_km: float, plan_pace_s_per_km: float,
         "track_pointdata": to_point_data(export_samples, crs=crs,
                                          total_steps=buckets["total_steps"]),
         "samples": samples,
+        # ⚠️ 导出的（**带 GPS 噪声**的）样本：`samples` 是未加噪的内部采样。
+        #    中途停止（truncate）重建上传坐标时**必须**用这份带噪的，否则整条丢噪声。
+        "export_samples": export_samples,
         "path_used": pts,
         "mid_pauses": mid_pauses,
         "submit": form,
@@ -1579,7 +1582,9 @@ def truncate(gen: Dict[str, Any], cut_ms: int,
       （真 app 里停跑也得先过结束人脸才交得上去）。
     * 返回值是新 dict（不就地改 `gen`），多两个键：`truncated=True` / `cut_ms`。
     """
-    samples = [dict(s) for s in (gen.get("samples") or [])]
+    # ⚠️ 用**导出的（带噪）**样本：GPS 噪声只活在 export_samples 里，`gen["samples"]` 是
+    #    未加噪的内部采样。以前用错 ⇒ 中途停止上传的坐标整条没噪声（真机一看就假）。
+    samples = [dict(s) for s in (gen.get("export_samples") or gen.get("samples") or [])]
     if not samples:
         return None
     cut = int(cut_ms or 0)
@@ -1694,6 +1699,7 @@ def truncate(gen: Dict[str, Any], cut_ms: int,
         "truncated": True, "cut_ms": cut,
         "stop_tail_ms": tail_ms,
         "samples": kept,
+        "export_samples": kept,
         "metrics": metrics,
         "steps": buckets,
         "faces": faces,
