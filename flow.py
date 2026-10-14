@@ -919,6 +919,68 @@ def run_flow(*, chain="v2", base=DEFAULT_BASE, school_code=DEFAULT_SCHOOL,
     return r
 
 
+def _ring_centroid(ring):
+    """区域多边形的中心（经,纬）；点认 lng/lat 或 longitude/latitude。空的返 None。"""
+    xs, ys = [], []
+    for p in (ring or []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            xs.append(float(p.get("lng", p.get("longitude"))))
+            ys.append(float(p.get("lat", p.get("latitude"))))
+        except Exception:                                    # noqa: BLE001
+            continue
+    if not xs:
+        return None
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _recent_fence_index(c) -> int:
+    """「最近一次跑步用的是哪个区域」：记录自带的 `geofence` 是**学校全量**（与设置同一份），
+    分不出单次跑的哪个区域，所以要看这条记录**自己跑的轨迹**离哪个区域中心最近
+    （记录轨迹与围栏同属学校口径 GCJ-02，直接比，不做换算）。取最近一条带轨迹的记录，返回区域下标。"""
+    def _t(r):
+        try:
+            return int((r or {}).get("startTime") or (r or {}).get("addTime") or 0)
+        except Exception:                                    # noqa: BLE001
+            return 0
+    lst = c.list_records()
+    recs = ((lst or {}).get("records") if isinstance(lst, dict)
+            else (lst if isinstance(lst, list) else [])) or []
+    for r0 in sorted(recs, key=_t, reverse=True):
+        rid = (r0 or {}).get("id")
+        if not rid:
+            continue
+        dd = c.get_record(rid) or {}
+        rings = dd.get("geofence") or []
+        track = dd.get("gitudeLatitude") or dd.get("pointList") or []
+        if not isinstance(rings, list) or len(rings) < 2 or not isinstance(track, list) or not track:
+            continue
+        xs, ys = [], []
+        for q in track:
+            if not isinstance(q, dict):
+                continue
+            try:
+                xs.append(float(q.get("o", q.get("lng"))))
+                ys.append(float(q.get("a", q.get("lat"))))
+            except Exception:                                # noqa: BLE001
+                continue
+        if not xs:
+            continue
+        tc = (sum(xs) / len(xs), sum(ys) / len(ys))
+        best, bd = None, None
+        for i, ring in enumerate(rings):
+            rc = _ring_centroid(ring)
+            if not rc:
+                continue
+            d = (rc[0] - tc[0]) ** 2 + (rc[1] - tc[1]) ** 2
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None:
+            return best
+    return None
+
+
 # ============================================================ 分步（向导：一环扣一环）
 def stage_login(*, chain="v1", base=DEFAULT_BASE, school_code=DEFAULT_SCHOOL,
                 username=DEFAULT_USER, password=DEFAULT_PASS, run_type=1,
@@ -967,6 +1029,38 @@ def stage_login(*, chain="v1", base=DEFAULT_BASE, school_code=DEFAULT_SCHOOL,
             out["set_ok"] = False
             out["set_msg"] = _err_text(e)
             bean = {}
+        # 围栏兜底：getExerciseSetting 在学校「当前未开放 / 今日已达标」时会回 999（拿不到 bean），
+        # 但「有效区域」是学校固定属性，用户的历史跑步记录里也带着**同一份** —— 设置里没围栏时，
+        # 就从最近一条记录取（记录读取不受时段限制），免得登录后误报「该学校没设置围栏」。
+        if not (bean or {}).get("geofence"):
+            try:
+                _lst = c.list_records()
+                _recs = ((_lst or {}).get("records") if isinstance(_lst, dict)
+                         else (_lst if isinstance(_lst, list) else [])) or []
+                for _r0 in _recs:
+                    _rid = (_r0 or {}).get("id")
+                    if not _rid:
+                        continue
+                    _dd = c.get_record(_rid) or {}
+                    if _dd.get("geofence"):
+                        bean = dict(bean or {})
+                        bean["geofence"] = _dd["geofence"]
+                        out["geofence_from"] = "record"
+                        st.add("回落最近记录的围栏", True,
+                               "记录 %s 带出 %d 个区域" % (_rid, len(_dd["geofence"])))
+                        break
+            except Exception as e:                           # noqa: BLE001
+                st.add("回落最近记录的围栏", False, _err_text(e))
+        # 「最近一次跑步用哪个区域」：好让选择弹层把那个区域标成（推荐）。
+        # 记录自带的 geofence 是学校全量（分不出），所以看它**自己跑的轨迹**落在哪个区域附近。
+        if len(bean.get("geofence") or []) >= 2:
+            try:
+                _ri = _recent_fence_index(c)
+                if _ri is not None:
+                    out["recent_region"] = _ri
+                    st.add("识别最近一次跑步的区域", True, "区域 #%d" % (_ri + 1))
+            except Exception as e:                           # noqa: BLE001
+                st.add("识别最近一次跑步的区域", False, _err_text(e))
         # 顺手问一句「本人有没有已注册底片」—— 要扫脸的学校，这一步就该知道
         # （拿底片去打卡才过得了服务器的 1:1 比对；取不到就只剩「你自己传照片」或占位图）。
         _uid, _album = _probe_face_album(c, bean.get("identify"))
@@ -982,6 +1076,12 @@ def stage_login(*, chain="v1", base=DEFAULT_BASE, school_code=DEFAULT_SCHOOL,
                        "is_mid_face": bean.get("isMidwayFace"),
                        "middle_faces": bean.get("middleFaces"),
                        "limit_speed": bean.get("limitSpeed"),
+                       # 有效区域（电子围栏）：只有登录后才拿得到 —— 前端据此在地图上画出
+                       # 学校允许跑的范围（可能 1 个或多个多边形），并做「电子围栏自检」。
+                       "geofence": bean.get("geofence"),
+                       "geofence_from": out.get("geofence_from") or "setting",
+                       "recent_region": out.get("recent_region"),
+                       "is_sequence_point": bean.get("isSequencePoint"),
                        "bas_user_id": _uid, "face_album": _album}
     else:
         import server as S
