@@ -455,6 +455,14 @@ class V2Client:
         self.trace.append({"step": "sumExerciseRecord", "code": j.get("code")})
         return j.get("data") or {}
 
+    def get_feedback_balance(self) -> dict:
+        """getFeedbackBalance —— 本学期剩余次数（`validity?Run` 应跑 / `balance?Run` 还剩）。"""
+        ts = str(int(time.time() * 1000))
+        j = self._req("GET", V2.route_path("getFeedbackBalance"), query={},
+                      headers=self.headers(self.sign({}, ts), ts))
+        self.trace.append({"step": "getFeedbackBalance", "code": j.get("code")})
+        return j.get("data") or {}
+
     def list_records(self, status: int = 1, date: str = "", page: int = 1) -> Any:
         params = {"status": status, "date": date, "datePageIndex": page}
         ts = str(int(time.time() * 1000))
