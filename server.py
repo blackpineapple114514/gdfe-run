@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -36,6 +37,14 @@ TOOLS = os.path.dirname(HERE)
 PROJ = os.path.dirname(TOOLS)
 STATIC = os.path.join(HERE, "static")
 ROUTES_DIR = os.environ.get("ROUTE_STUDIO_ROUTES") or os.path.join(HERE, "routes")
+
+# 版本（edition）：精简版 / 完整版**共用同一份源码**，靠可执行文件名区分 —— 名字里带 "full" 就是完整版。
+# 开发 / 自测可用 --edition 覆盖。前端按 /api/config 的 edition 决定显示哪些控件。
+def _detect_edition() -> str:
+    name = os.path.basename(sys.executable or (sys.argv[0] if sys.argv else "") or "").lower()
+    return "full" if "full" in name else "lite"
+
+EDITION = _detect_edition()
 sys.path.insert(0, HERE)
 sys.path.insert(0, TOOLS)
 
@@ -130,6 +139,27 @@ def _gdfe_creds_clear() -> None:
             os.remove(GDFE_CREDS_FILE)
     except Exception:                                        # noqa: BLE001
         pass
+
+
+def _creds_payload() -> dict:
+    """GET /api/creds 的响应：本机记住的账号密码（明文，仅本机）。"""
+    d = _gdfe_creds_load()
+    return {"ok": True, "saved": os.path.isfile(GDFE_CREDS_FILE),
+            "username": d.get("username") or "", "password": d.get("password") or ""}
+
+
+def _creds_apply(body: dict) -> dict:
+    """POST /api/creds：action=clear/forget/delete 删除；否则保存账号密码。"""
+    b = body or {}
+    if str(b.get("action") or "save").lower() in ("clear", "forget", "delete"):
+        _gdfe_creds_clear()
+        return {"ok": True, "saved": False}
+    u = str(b.get("username") or "")
+    pw = b.get("password")
+    pw = "" if pw is None else str(pw)
+    if u or pw:
+        _gdfe_creds_save(u, pw)
+    return {"ok": True, "saved": os.path.isfile(GDFE_CREDS_FILE)}
 
 
 def _gdfe_device_load() -> dict:
@@ -261,6 +291,24 @@ def _gdfe_real_base() -> str:
             if b:
                 return b
     return GDFE_REAL_BASE_FALLBACK
+
+
+_RUN_TYPE_NAME = {0: "自由跑", 1: "阳光跑", 2: "晨跑"}
+
+
+def _day_of_ms(ms) -> str:
+    """毫秒时间戳 → **本机时区**的 `YYYY-MM-DD`（今日判定 / 记录日期共用）。"""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(ms) / 1000.0))
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _num(v, d=0.0) -> float:
+    try:
+        return float(v)
+    except Exception:                                            # noqa: BLE001
+        return d
 
 
 def _gdfe_login(body: dict) -> dict:
@@ -595,11 +643,8 @@ class H(BaseHTTPRequestHandler):
                                "cred_ready": os.path.isfile(GDFE_CRED_FILE),
                                "creds_file": GDFE_CREDS_FILE,
                                "creds_saved": os.path.isfile(GDFE_CREDS_FILE)})
-        if p == "/api/gdfe/creds":
-            d = _gdfe_creds_load()
-            return self._json({"ok": True, "saved": os.path.isfile(GDFE_CREDS_FILE),
-                               "username": d.get("username") or "",
-                               "password": d.get("password") or ""})
+        if p in ("/api/gdfe/creds", "/api/creds"):
+            return self._json(_creds_payload())
         if p == "/api/gdfe/devices":
             # 机型目录（唯一出处 device_profile.CATALOG）+ 用户自加机型 + 「默认机型」 + 本机选定值。
             dflt = _gdfe_default_load()
@@ -618,6 +663,7 @@ class H(BaseHTTPRequestHandler):
             return self._file(os.path.join(STATIC, name), ctype)
         if p == "/api/config":
             return self._json({
+                "edition": EDITION,
                 "center": DEFAULT_CENTER,
                 "flow": {
                     "chain": "v2",
@@ -721,17 +767,10 @@ class H(BaseHTTPRequestHandler):
                 return self._json(_gdfe_login(self._body()))
             if p == "/api/gdfe/history":
                 return self._json(self._gdfe_history(self._body()))
-            if p == "/api/gdfe/creds":
-                b = self._body()
-                if str(b.get("action") or "save").lower() in ("clear", "forget", "delete"):
-                    _gdfe_creds_clear()
-                    return self._json({"ok": True, "saved": False})
-                u = str(b.get("username") or "")
-                pw = b.get("password")
-                pw = "" if pw is None else str(pw)
-                if u or pw:
-                    _gdfe_creds_save(u, pw)
-                return self._json({"ok": True, "saved": os.path.isfile(GDFE_CREDS_FILE)})
+            if p == "/api/today":
+                return self._json(self._gdfe_today(self._body()))
+            if p in ("/api/gdfe/creds", "/api/creds"):
+                return self._json(_creds_apply(self._body()))
             if p == "/api/gdfe/device":
                 # 保存「选定机型」（下拉选中后固定）；action=clear/reset 则删掉回默认档。
                 b = self._body()
@@ -897,8 +936,9 @@ class H(BaseHTTPRequestHandler):
         try:
             c = V2C.V2Client(base, school_code=GDFE_SCHOOL, token=token,
                              device=body.get("device"), app_version=body.get("app_version"))
-            recs = c.list_records(status=int(body.get("status", 1)),
-                                  page=int(body.get("page", 1)))
+            raw = c.list_records(status=int(body.get("status", 1)),
+                                 date=str(body.get("date") or ""),
+                                 page=int(body.get("page", 1)))
             try:
                 summ = c.sum_()
             except Exception:                                    # noqa: BLE001
@@ -907,14 +947,128 @@ class H(BaseHTTPRequestHandler):
             import traceback
             return {"ok": False, "error": repr(e),
                     "trace": traceback.format_exc()[-1500:]}
-        items = recs
-        if isinstance(items, dict):
-            items = (items.get("records") or items.get("rows") or items.get("list")
-                     or items.get("data") or [])
+        meta = raw if isinstance(raw, dict) else {}
+        items = (meta.get("records") or meta.get("rows") or meta.get("list")
+                 or meta.get("data") or raw)
         if not isinstance(items, list):
             items = []
+        # 给每条记录补一个可读日期（前端不再自己按时区换算）。
+        for r in items:
+            if isinstance(r, dict) and not r.get("day"):
+                r["day"] = _day_of_ms(r.get("startTime"))
         return {"ok": True, "base": base, "records": items, "sum": summ,
-                "count": len(items)}
+                "count": (meta.get("count") if meta else len(items)) or len(items),
+                "dates": meta.get("dates") or [],
+                "totalRange": meta.get("totalRange"), "totalTime": meta.get("totalTime"),
+                "isShowSunRun": meta.get("isShowSunRun"),
+                "isShowMorningRun": meta.get("isShowMorningRun"),
+                "isShowFreedom": meta.get("isShowFreedom")}
+
+
+    def _gdfe_today(self, body: dict) -> dict:
+        """登录后自动检测：**今天还能不能跑**（只读；不生成 / 不上传 / 不写记录）。
+
+        判据（由强到弱）：
+          ① `getExerciseSetting(runType)` 成败 —— 服务器对「现在这条能不能跑」的**权威**答复；
+             回 999 时 `msg` 就是原因（今日已达标 / 该类未开放）。
+          ② `listExerciseRecord(status=1)` 里有没有落在**今天**的记录 —— 「每日一次」用没用掉。
+          ③ `getFeedbackBalance` —— 本学期剩余次数。
+          ④ `sumExerciseRecord` —— 三种类型的开放情况 + 已跑次数。
+        """
+        try:
+            import v2client as V2C
+        except Exception as e:                                   # noqa: BLE001
+            return {"ok": False, "error": "v2client 未加载: %r" % e}
+        server = str(body.get("server") or "real").lower()
+        sess = _SESS.get(body.get("sid") or "") or {}
+        base = str(body.get("base") or sess.get("base") or "").strip()
+        if not base:
+            base = (_gdfe_real_base() if server == "real"
+                    else (ARGS.mock_base if ARGS else "http://127.0.0.1:18080"))
+        token = body.get("token") or sess.get("token")
+        if not token:
+            lg = _gdfe_login({"server": server, "base": base,
+                              "username": body.get("username"),
+                              "password": body.get("password"),
+                              "device": body.get("device"),
+                              "app_version": body.get("app_version"),
+                              "run_type": int(body.get("run_type", 1))})
+            if not lg.get("ok"):
+                return {"ok": False, "needLogin": True,
+                        "error": lg.get("error") or "登录失败"}
+            sess = _SESS.get(lg.get("sid") or "") or {}
+            token = sess.get("token")
+            base = lg.get("base") or base
+        run_type = int(body.get("run_type", 1))
+        try:
+            c = V2C.V2Client(base, school_code=GDFE_SCHOOL, token=token,
+                             device=body.get("device"), app_version=body.get("app_version"))
+        except Exception as e:                                   # noqa: BLE001
+            return {"ok": False, "error": repr(e)}
+        out = {"ok": True, "base": base, "server": server, "run_type": run_type,
+               "run_type_name": _RUN_TYPE_NAME.get(run_type, str(run_type))}
+        # ① 服务器权威：这条现在能不能跑
+        try:
+            c.setting(run_type)
+            out["set_ok"] = True
+            out["set_msg"] = ""
+        except Exception as e:                                   # noqa: BLE001
+            out["set_ok"] = False
+            _m = (str(e) if getattr(e, "payload", None) is not None else repr(e))
+            # 去掉「v2 999: HTTP 999 」这层前缀，只留服务器原话（给页面当提示更干净）。
+            _mm = re.match(r"^v2\s*\d+\s*:\s*HTTP\s*\d+\s*(.*)$", _m)
+            out["set_msg"] = (_mm.group(1).strip() if _mm else _m)
+        # ② 今天的记录
+        today = time.strftime("%Y-%m-%d")
+        out["today"] = {"date": today, "count": 0, "km": 0.0, "records": []}
+        try:
+            raw = c.list_records(status=1, date="", page=1)
+            recs = (raw.get("records") if isinstance(raw, dict) else raw) or []
+            if not isinstance(recs, list):
+                recs = []
+            out["recent"] = [{"id": r.get("id"), "day": _day_of_ms(r.get("startTime")),
+                              "km": round(_num(r.get("sportRange")), 3),
+                              "sec": int(_num(r.get("sportTime"))),
+                              "remark": r.get("remark")}
+                             for r in recs[:8] if isinstance(r, dict)]
+            todays = [r for r in recs if isinstance(r, dict)
+                      and _day_of_ms(r.get("startTime")) == today]
+            out["today"] = {"date": today, "count": len(todays),
+                            "km": round(sum(_num(r.get("sportRange")) for r in todays), 3),
+                            "records": [{"id": r.get("id"),
+                                         "km": round(_num(r.get("sportRange")), 3),
+                                         "sec": int(_num(r.get("sportTime"))),
+                                         "remark": r.get("remark")} for r in todays]}
+        except Exception as e:                                   # noqa: BLE001
+            out["recent_err"] = repr(e)
+        # ③ 剩余次数
+        try:
+            out["balance"] = c.get_feedback_balance()
+        except Exception as e:                                   # noqa: BLE001
+            out["balance_err"] = repr(e)
+        # ④ 开放情况
+        try:
+            out["sum"] = c.sum_()
+        except Exception:                                        # noqa: BLE001
+            out["sum"] = {}
+        # 结论：以服务器的 setting 答复为准，记录 / 余额只做旁证
+        msg = out.get("set_msg") or ""
+        if out.get("set_ok"):
+            out["canRun"] = True
+            out["verdict"] = "可以跑"
+            out["reason"] = "服务器已开放「%s」" % out["run_type_name"]
+        else:
+            out["canRun"] = False
+            if ("达标" in msg) or ("每日" in msg) or ("每天" in msg):
+                out["verdict"] = "今天已经跑过了"
+                out["reason"] = msg or "今日成绩已达标"
+            elif ("未开放" in msg) or ("未开启" in msg) or ("未开始" in msg):
+                out["verdict"] = "这类跑步现在没开放"
+                out["reason"] = msg
+            else:
+                out["verdict"] = "现在跑不了"
+                out["reason"] = msg or "服务器拒绝了这条跑步"
+        return out
 
     def _stage_login(self, body: dict) -> dict:
         """**第一步：登录**。只登录 + 拉设置，不生成、不上传、不写任何跑步记录。
@@ -1108,6 +1262,7 @@ class H(BaseHTTPRequestHandler):
         fp = os.path.join(ROUTES_DIR, "%s.json" % rid)
         with open(fp, "w", encoding="utf-8") as f:
             json.dump({"name": name, "id": rid, "points": body.get("points") or [],
+                       "points_crs": "wgs84",          # 存盘的点**一律**内部 WGS-84（与 params.crs 的「导出/交换口径」分开，免得标错帧）
                        "params": body.get("params") or {},
                        "saved_at": int(time.time())}, f, ensure_ascii=False, indent=1)
         return {"ok": True, "id": rid, "file": os.path.relpath(fp, PROJ)}
@@ -1130,7 +1285,12 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--mock-base", default=None,
                     help="自带 mock 的地址（/api/config 的 flow.base 会用它；app.py 启动时传入）")
+    ap.add_argument("--edition", default=None, choices=["lite", "full"],
+                    help="覆盖版本（默认按可执行文件名判定：含 full ⇒ 完整版）")
     ARGS = ap.parse_args()
+    global EDITION
+    if ARGS.edition:
+        EDITION = ARGS.edition
     os.makedirs(STATIC, exist_ok=True)
     os.makedirs(ROUTES_DIR, exist_ok=True)
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), H)
